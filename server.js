@@ -11,6 +11,7 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
+import nodemailer from 'nodemailer';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -303,6 +304,103 @@ class YahooMailMCPServer {
                             type: 'object',
                             properties: {}
                         }
+                    },
+                    {
+                        name: 'create_folder',
+                        description: 'Create a new IMAP folder/mailbox in your Yahoo Mail account',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                folderName: {
+                                    type: 'string',
+                                    description: 'Name of the folder to create'
+                                }
+                            },
+                            required: ['folderName']
+                        }
+                    },
+                    {
+                        name: 'create_draft',
+                        description: 'Save a draft email to the Yahoo Mail Drafts folder. The email is never sent — only saved.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                to: {
+                                    type: 'string',
+                                    description: 'Recipient email address(es)'
+                                },
+                                subject: {
+                                    type: 'string',
+                                    description: 'Email subject line'
+                                },
+                                body: {
+                                    type: 'string',
+                                    description: 'Plain-text body of the email'
+                                },
+                                cc: {
+                                    type: 'string',
+                                    description: 'CC recipient(s) (optional)',
+                                    default: null
+                                },
+                                bcc: {
+                                    type: 'string',
+                                    description: 'BCC recipient(s) (optional)',
+                                    default: null
+                                }
+                            },
+                            required: ['to', 'subject', 'body']
+                        }
+                    },
+                    {
+                        name: 'send_draft',
+                        description: 'Send an existing draft from the Drafts folder using its UID. Requires explicit UID — will not send without one.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uid: {
+                                    type: 'number',
+                                    description: 'UID of the draft to send (from list_emails on Drafts folder)'
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Drafts folder name (optional, auto-detected if omitted)',
+                                    default: null
+                                }
+                            },
+                            required: ['uid']
+                        }
+                    },
+                    {
+                        name: 'get_folder_stats',
+                        description: 'Get total and unread message counts for one folder or all folders',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder name to get stats for (optional — omit to return stats for all folders)',
+                                    default: null
+                                }
+                            }
+                        }
+                    },
+                    {
+                        name: 'rename_folder',
+                        description: 'Rename an existing IMAP folder. System folders (INBOX, Drafts, Draft, Sent, Trash, Spam, Bulk Mail) cannot be renamed.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                oldName: {
+                                    type: 'string',
+                                    description: 'Current name of the folder'
+                                },
+                                newName: {
+                                    type: 'string',
+                                    description: 'New name for the folder'
+                                }
+                            },
+                            required: ['oldName', 'newName']
+                        }
                     }
                 ]
             };
@@ -353,6 +451,21 @@ class YahooMailMCPServer {
 
                     case 'list_folders':
                         return await this.listFolders();
+
+                    case 'create_folder':
+                        return await this.createFolder(args.folderName);
+
+                    case 'create_draft':
+                        return await this.createDraft(args.to, args.subject, args.body, args?.cc || null, args?.bcc || null);
+
+                    case 'send_draft':
+                        return await this.sendDraft(args.uid, args?.folder || null);
+
+                    case 'get_folder_stats':
+                        return await this.getFolderStats(args?.folder || null);
+
+                    case 'rename_folder':
+                        return await this.renameFolder(args.oldName, args.newName);
 
                     default:
                         throw new Error(`Unknown tool: ${name}`);
@@ -1216,6 +1329,299 @@ class YahooMailMCPServer {
                             folders: folders,
                             count: folders.length
                         }, null, 2)
+                    }]
+                });
+            });
+        });
+    }
+
+    /**
+     * Helper: detect whether the Drafts folder is named "Draft" or "Drafts"
+     */
+    async detectDraftsFolder() {
+        const imap = await this.createImapConnection();
+        return new Promise((resolve) => {
+            imap.getBoxes((err, boxes) => {
+                imap.end();
+                if (err) {
+                    resolve('Drafts');
+                    return;
+                }
+                const names = this.flattenFolders(boxes).map(f => f.name);
+                resolve(names.includes('Draft') ? 'Draft' : 'Drafts');
+            });
+        });
+    }
+
+    /**
+     * Create a new IMAP folder
+     */
+    async createFolder(folderName) {
+        if (!folderName || typeof folderName !== 'string' || folderName.trim().length === 0) {
+            return {
+                content: [{ type: 'text', text: 'Error: folderName is required' }]
+            };
+        }
+
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.addBox(folderName, (err) => {
+                imap.end();
+                if (err) {
+                    reject(new Error(`Failed to create folder "${folderName}": ${err.message}`));
+                    return;
+                }
+                resolve({
+                    content: [{ type: 'text', text: `Successfully created folder: ${folderName}` }]
+                });
+            });
+        });
+    }
+
+    /**
+     * Save a draft email to the Drafts folder via IMAP APPEND
+     */
+    async createDraft(to, subject, body, cc = null, bcc = null) {
+        if (!to || !subject || !body) {
+            return {
+                content: [{ type: 'text', text: 'Error: to, subject, and body are required' }]
+            };
+        }
+
+        const from = process.env.YAHOO_EMAIL;
+        if (!from) {
+            return {
+                content: [{ type: 'text', text: 'Error: YAHOO_EMAIL environment variable is not set' }]
+            };
+        }
+
+        const draftsFolder = await this.detectDraftsFolder();
+
+        // Build MIME message buffer using nodemailer stream transport (no email is sent)
+        const streamTransport = nodemailer.createTransport({ streamTransport: true, newline: 'unix', buffer: true });
+        const mailOptions = { from, to, subject, text: body };
+        if (cc) mailOptions.cc = cc;
+        if (bcc) mailOptions.bcc = bcc;
+
+        const info = await streamTransport.sendMail(mailOptions);
+        const mimeBuffer = info.message;
+
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.append(mimeBuffer, {
+                mailbox: draftsFolder,
+                flags: ['\\Draft', '\\Seen'],
+                date: new Date()
+            }, (err) => {
+                imap.end();
+                if (err) {
+                    reject(new Error(`Failed to save draft to ${draftsFolder}: ${err.message}`));
+                    return;
+                }
+                resolve({
+                    content: [{
+                        type: 'text',
+                        text: `Draft saved to ${draftsFolder} — Subject: "${subject}", To: ${to}`
+                    }]
+                });
+            });
+        });
+    }
+
+    /**
+     * Send an existing draft by UID via SMTP, then move to Sent
+     */
+    async sendDraft(uid, folder = null) {
+        if (!uid || typeof uid !== 'number' || uid <= 0 || !Number.isInteger(uid)) {
+            return {
+                content: [{ type: 'text', text: 'Error: uid must be a positive integer' }]
+            };
+        }
+
+        const draftsFolder = folder || await this.detectDraftsFolder();
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.openBox(draftsFolder, false, (err) => {
+                if (err) {
+                    imap.end();
+                    reject(new Error(`Failed to open folder "${draftsFolder}": ${err.message}`));
+                    return;
+                }
+
+                const fetch = imap.fetch(uid.toString(), { bodies: '' });
+                let buffer = '';
+
+                fetch.on('message', (msg) => {
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => { buffer += chunk.toString('ascii'); });
+                    });
+                });
+
+                fetch.once('error', (fetchErr) => {
+                    imap.end();
+                    reject(new Error(`Failed to fetch draft UID ${uid}: ${fetchErr.message}`));
+                });
+
+                fetch.once('end', async () => {
+                    try {
+                        const parsed = await simpleParser(buffer);
+
+                        const smtpTransport = nodemailer.createTransport({
+                            host: 'smtp.mail.yahoo.com',
+                            port: 465,
+                            secure: true,
+                            auth: {
+                                user: process.env.YAHOO_EMAIL,
+                                pass: process.env.YAHOO_APP_PASSWORD
+                            }
+                        });
+
+                        await smtpTransport.sendMail({
+                            from: process.env.YAHOO_EMAIL,
+                            to: parsed.to?.text,
+                            cc: parsed.cc?.text || undefined,
+                            subject: parsed.subject,
+                            text: parsed.text || undefined,
+                            html: parsed.html || undefined
+                        });
+
+                        // Move draft to Sent after successful send
+                        imap.move(uid.toString(), 'Sent', (moveErr) => {
+                            imap.end();
+                            if (moveErr) {
+                                resolve({
+                                    content: [{
+                                        type: 'text',
+                                        text: `Email sent to ${parsed.to?.text}. Note: could not move draft to Sent folder: ${moveErr.message}`
+                                    }]
+                                });
+                            } else {
+                                resolve({
+                                    content: [{
+                                        type: 'text',
+                                        text: `Email sent to ${parsed.to?.text} and draft moved to Sent folder`
+                                    }]
+                                });
+                            }
+                        });
+                    } catch (sendErr) {
+                        imap.end();
+                        reject(new Error(`Failed to send email: ${sendErr.message}`));
+                    }
+                });
+            });
+        });
+    }
+
+    /**
+     * Get total and unread counts for one or all folders
+     */
+    async getFolderStats(folder = null) {
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            if (folder) {
+                imap.status(folder, (err, status) => {
+                    imap.end();
+                    if (err) {
+                        reject(new Error(`Failed to get stats for folder "${folder}": ${err.message}`));
+                        return;
+                    }
+                    resolve({
+                        content: [{
+                            type: 'text',
+                            text: JSON.stringify([{
+                                folder: folder,
+                                total: status.messages || 0,
+                                unread: status.unseen || 0
+                            }], null, 2)
+                        }]
+                    });
+                });
+            } else {
+                imap.getBoxes((err, boxes) => {
+                    if (err) {
+                        imap.end();
+                        reject(new Error(`Failed to retrieve folders: ${err.message}`));
+                        return;
+                    }
+
+                    const folders = this.flattenFolders(boxes)
+                        .filter(f => f.selectable)
+                        .map(f => f.name);
+
+                    if (folders.length === 0) {
+                        imap.end();
+                        resolve({ content: [{ type: 'text', text: JSON.stringify([], null, 2) }] });
+                        return;
+                    }
+
+                    const stats = [];
+
+                    const processNext = (index) => {
+                        if (index >= folders.length) {
+                            imap.end();
+                            resolve({
+                                content: [{ type: 'text', text: JSON.stringify(stats, null, 2) }]
+                            });
+                            return;
+                        }
+
+                        imap.status(folders[index], (statusErr, status) => {
+                            if (!statusErr && status) {
+                                stats.push({
+                                    folder: folders[index],
+                                    total: status.messages || 0,
+                                    unread: status.unseen || 0
+                                });
+                            }
+                            processNext(index + 1);
+                        });
+                    };
+
+                    processNext(0);
+                });
+            }
+        });
+    }
+
+    /**
+     * Rename an existing IMAP folder (system folders are protected)
+     */
+    async renameFolder(oldName, newName) {
+        const systemFolders = new Set(['INBOX', 'Drafts', 'Draft', 'Sent', 'Trash', 'Spam', 'Bulk Mail']);
+
+        if (!oldName || typeof oldName !== 'string' || oldName.trim().length === 0) {
+            return { content: [{ type: 'text', text: 'Error: oldName is required' }] };
+        }
+        if (!newName || typeof newName !== 'string' || newName.trim().length === 0) {
+            return { content: [{ type: 'text', text: 'Error: newName is required' }] };
+        }
+        if (systemFolders.has(oldName)) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: Cannot rename system folder "${oldName}"`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.renameBox(oldName, newName, (err) => {
+                imap.end();
+                if (err) {
+                    reject(new Error(`Failed to rename folder "${oldName}" to "${newName}": ${err.message}`));
+                    return;
+                }
+                resolve({
+                    content: [{
+                        type: 'text',
+                        text: `Successfully renamed folder "${oldName}" to "${newName}"`
                     }]
                 });
             });
